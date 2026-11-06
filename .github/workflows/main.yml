@@ -20,11 +20,20 @@ jobs:
 
       - name: Prepare kernel modules for Android
         run: |
-          sudo apt-get update
-          sudo apt-get install -y linux-modules-extra-$(uname -r)
-          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+          echo "Kernel: $(uname -r)"
+          sudo apt-get update || true
+          sudo apt-get install -y "linux-modules-extra-$(uname -r)" || echo "No extra modules package for this kernel (continuing)"
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder" || echo "binder_linux module not available"
           sudo modprobe ashmem_linux || true
-          lsmod | grep -i binder || true
+          if ! ls /dev/binder /dev/hwbinder /dev/vndbinder > /dev/null 2>&1; then
+            echo "Trying binderfs instead"
+            sudo mkdir -p /dev/binderfs
+            sudo mount -t binder binder /dev/binderfs || true
+            for d in binder hwbinder vndbinder; do [ -e /dev/binderfs/$d ] && sudo ln -sf /dev/binderfs/$d /dev/$d; done
+          fi
+          ls -l /dev/binder /dev/hwbinder /dev/vndbinder /dev/binderfs 2>&1 || true
+          grep -i binder /proc/filesystems || true
+          if ! ls /dev/binder > /dev/null 2>&1; then echo "This runner kernel has no Android binder support. Use the Official emulator engine instead."; exit 1; fi
 
       - name: Install cloudflared
         run: |
