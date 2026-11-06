@@ -18,12 +18,13 @@ jobs:
           sudo rm -rf /usr/share/dotnet /opt/ghc /usr/local/lib/android /opt/hostedtoolcache/CodeQL || true
           df -h /
 
-      - name: Enable KVM (hardware acceleration)
+      - name: Prepare kernel modules for Android
         run: |
-          echo 'KERNEL=="kvm", GROUP="kvm", MODE="0666", OPTIONS+="static_node=kvm"' | sudo tee /etc/udev/rules.d/99-kvm4all.rules
-          sudo udevadm control --reload-rules
-          sudo udevadm trigger --name-match=kvm
-          ls -l /dev/kvm
+          sudo apt-get update
+          sudo apt-get install -y linux-modules-extra-$(uname -r)
+          sudo modprobe binder_linux devices="binder,hwbinder,vndbinder"
+          sudo modprobe ashmem_linux || true
+          lsmod | grep -i binder || true
 
       - name: Install cloudflared
         run: |
@@ -35,7 +36,7 @@ jobs:
           EMU_PASS: "uczUmsX9"
         run: |
           # --- 1. Cloudflare quick tunnel -> noVNC port ---
-          setsid nohup cloudflared tunnel --no-autoupdate --url http://localhost:6080 > tunnel.log 2>&1 &
+          setsid nohup cloudflared tunnel --no-autoupdate --url http://localhost:3000 > tunnel.log 2>&1 &
           URL=""
           for i in $(seq 1 30); do
             URL=$(grep -o 'https://[-a-z0-9]*\.trycloudflare\.com' tunnel.log | head -n1)
@@ -45,17 +46,36 @@ jobs:
           if [ -z "$URL" ]; then cat tunnel.log; echo "Tunnel failed"; exit 1; fi
 
           # --- 2. Start the Android emulator ---
-          docker run -d --name android -p 6080:6080 \
-            --device /dev/kvm \
-            -e EMULATOR_DEVICE="Samsung Galaxy S10" \
-            -e WEB_VNC=true \
-            -e VNC_PASSWORD="$EMU_PASS" \
-            budtmo/docker-android:emulator_11.0
+          docker run -d --name android --privileged -p 127.0.0.1:5555:5555 \
+            redroid/redroid:11.0.0-latest \
+            androidboot.redroid_width=1280 androidboot.redroid_height=800 \
+            androidboot.redroid_dpi=240 androidboot.redroid_fps=30
+
+          # Selkies desktop (the same smooth streaming as the browser and Linux pages)
+          docker run -d --name desktop --network host --shm-size=1gb --security-opt seccomp=unconfined \
+            -e PUID=1000 -e PGID=1000 -e TZ=UTC \
+            -e CUSTOM_USER=android -e PASSWORD="$EMU_PASS" \
+            lscr.io/linuxserver/webtop:ubuntu-xfce
+
+          # scrcpy shows the Android screen on that desktop
+          SC_TAG=$(curl -fsSLI -o /dev/null -w '%{url_effective}' https://github.com/Genymobile/scrcpy/releases/latest)
+          SC_TAG=${SC_TAG##*/}
+          curl -fsSL -o scrcpy.tar.gz "https://github.com/Genymobile/scrcpy/releases/download/$SC_TAG/scrcpy-linux-x86_64-$SC_TAG.tar.gz"
+          mkdir -p scrcpy-dir && tar -xzf scrcpy.tar.gz -C scrcpy-dir --strip-components=1
+          docker cp scrcpy-dir desktop:/opt/scrcpy
+
+          # Wait for Android to boot and accept ADB, then open it on the desktop
+          for i in $(seq 1 90); do
+            docker exec -u abc desktop /opt/scrcpy/adb connect localhost:5555 > /dev/null 2>&1 || true
+            if docker exec -u abc desktop /opt/scrcpy/adb devices | grep -q "localhost:5555.*device"; then echo "Android connected"; break; fi
+            sleep 3
+          done
+          docker exec -d -u abc -e DISPLAY=:1 -e ADB=/opt/scrcpy/adb -e SCRCPY_SERVER_PATH=/opt/scrcpy/scrcpy-server desktop /opt/scrcpy/scrcpy -s localhost:5555 --fullscreen --no-audio --render-driver=software
 
           # --- 3. Wait until the web page answers ---
           READY=""
           for i in $(seq 1 120); do
-            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:6080/ || true)
+            CODE=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:3000/ || true)
             if [ "$CODE" != "000" ]; then READY=1; break; fi
             sleep 2
           done
@@ -65,12 +85,12 @@ jobs:
           {
             echo "## Android is starting"
             echo ""
-            echo "$URL/?autoconnect=true&resize=scale"
+            echo "$URL"
             echo ""
-            echo "Enter your password when asked. The phone needs a few more minutes to boot."
+            echo "Sign in as android with the password you chose. The Android screen opens on the desktop after a minute or two."
           } >> "$GITHUB_STEP_SUMMARY"
 
-          echo "OPEN ANDROID: $URL/?autoconnect=true&resize=scale"
+          echo "OPEN ANDROID: $URL"
 
       - name: Keep alive
         env:
@@ -81,7 +101,8 @@ jobs:
           END=$(( $(date +%s) + M * 60 ))
           while [ "$(date +%s)" -lt "$END" ]; do
             if ! docker ps -q -f name=android | grep -q .; then echo "Emulator stopped"; docker logs android | tail -n 50; exit 1; fi
-            echo "[$(date)] Emulator status: $(docker exec android cat device_status 2>/dev/null || echo unknown) - cancel the workflow to stop"
+            docker exec desktop sh -c 'grep -qs scrcpy /proc/[0-9]*/comm' || { docker exec -u abc desktop /opt/scrcpy/adb connect localhost:5555 > /dev/null 2>&1; docker exec -d -u abc -e DISPLAY=:1 -e ADB=/opt/scrcpy/adb -e SCRCPY_SERVER_PATH=/opt/scrcpy/scrcpy-server desktop /opt/scrcpy/scrcpy -s localhost:5555 --fullscreen --no-audio --render-driver=software; } || true
+            echo "[$(date)] Android active - cancel the workflow to stop"
             sleep 60
           done
           docker stop android
